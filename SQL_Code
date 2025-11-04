@@ -1,0 +1,194 @@
+-- contract_inflation_analysis.sql
+-- BigQuery Standard SQL
+-- Sanitary version of original analysis. Replace placeholders below:
+--  - `{{PROJECT}}`  -> your GCP project id
+--  - `{{DATASET}}`  -> dataset containing the tables
+--  - `purchase_table` and `itemprice_table` -> actual table names
+-- Notes: all proprietary field names removed and replaced with generic names.
+
+-- Example usage:
+-- Replace occurrences of `{{PROJECT}}.{{DATASET}}.purchase_table` and `...itemprice_table`
+-- with your real table references before running.
+
+-- MAIN
+WITH stable_contracts AS (
+  -- Identify contracts with purchases in BOTH years (2023 & 2024)
+  SELECT DISTINCT 
+    ip.contract_number,
+    p.product_id
+  FROM `{{PROJECT}}.{{DATASET}}.purchase_table` p
+  JOIN `{{PROJECT}}.{{DATASET}}.itemprice_table` ip 
+    ON p.product_id = ip.product_id
+  WHERE p.data_source = 'APFeed File'
+    AND EXTRACT(YEAR FROM DATE(p.invoice_date)) = 2023
+
+  INTERSECT
+
+  SELECT DISTINCT 
+    ip.contract_number,
+    p.product_id
+  FROM `{{PROJECT}}.{{DATASET}}.purchase_table` p
+  JOIN `{{PROJECT}}.{{DATASET}}.itemprice_table` ip 
+    ON p.product_id = ip.product_id
+  WHERE p.data_source = 'APFeed File'
+    AND EXTRACT(YEAR FROM DATE(p.invoice_date)) = 2024
+),
+
+base_data AS (
+  SELECT
+    ip.contract_number,
+    p.category_name,
+    p.sku,
+    p.product_id,
+    ip.tier_name,
+    EXTRACT(YEAR FROM DATE(p.invoice_date)) AS year_int,
+    SAFE_DIVIDE(SUM(p.price_each), NULLIF(SUM(p.unit_quantity), 0)) AS avg_price,
+    SUM(p.unit_quantity) AS total_quantity,
+    SUM(p.price_each) AS total_spend,
+    COUNT(DISTINCT p.facility_id) AS facility_count
+  FROM `{{PROJECT}}.{{DATASET}}.purchase_table` p
+  JOIN `{{PROJECT}}.{{DATASET}}.itemprice_table` ip 
+    ON p.product_id = ip.product_id
+  INNER JOIN stable_contracts sc
+    ON ip.contract_number = sc.contract_number 
+    AND p.product_id = sc.product_id
+  WHERE 
+    p.data_source = 'APFeed File'
+    AND EXTRACT(YEAR FROM DATE(p.invoice_date)) IN (2023, 2024)
+  GROUP BY ip.contract_number, p.category_name, p.sku, p.product_id, ip.tier_name, year_int
+),
+
+contract_price_pairs AS (
+  SELECT 
+    b2023.contract_number,
+    b2023.category_name,
+    b2023.sku,
+    b2023.tier_name,
+    b2023.avg_price AS price_2023,
+    b2024.avg_price AS price_2024,
+    b2023.total_quantity AS quantity_2023,
+    b2024.total_quantity AS quantity_2024,
+    b2023.total_spend AS spend_2023,
+    b2024.total_spend AS spend_2024,
+    b2023.facility_count AS facilities_2023,
+    b2024.facility_count AS facilities_2024,
+    CASE 
+      WHEN b2023.avg_price > 0 THEN 
+        ((b2024.avg_price - b2023.avg_price) / b2023.avg_price) * 100
+      ELSE NULL 
+    END AS price_change_pct
+  FROM base_data b2023
+  INNER JOIN base_data b2024 
+    ON b2023.contract_number = b2024.contract_number
+    AND b2023.sku = b2024.sku
+    AND b2023.category_name = b2024.category_name
+    AND b2023.tier_name = b2024.tier_name
+    AND b2023.product_id = b2024.product_id
+    AND b2023.year_int = 2023 
+    AND b2024.year_int = 2024
+  WHERE b2023.avg_price > 0
+    AND b2024.avg_price > 0
+),
+
+contract_category_spend AS (
+  SELECT
+    contract_number,
+    category_name,
+    SUM(spend_2023) AS category_spend
+  FROM contract_price_pairs
+  GROUP BY contract_number, category_name
+),
+
+primary_categories AS (
+  SELECT
+    contract_number,
+    category_name AS primary_category,
+    category_spend,
+    ROW_NUMBER() OVER (PARTITION BY contract_number ORDER BY category_spend DESC) as rn
+  FROM contract_category_spend
+),
+
+contract_stats AS (
+  SELECT
+    cp.contract_number,
+    pc.primary_category,
+    -- Weighted average inflation
+    SUM(cp.price_change_pct * cp.spend_2023) / NULLIF(SUM(cp.spend_2023), 0) AS weighted_inflation_pct,
+    -- Median to reduce outlier impact
+    APPROX_PERCENTILE(cp.price_change_pct, 0.5) AS median_inflation_pct,
+    -- Count and volume metrics
+    COUNT(*) AS product_count,
+    COUNT(DISTINCT cp.category_name) AS category_count,
+    COUNT(DISTINCT cp.tier_name) AS tier_count,
+    SUM(cp.spend_2023) AS total_base_spend,
+    AVG(cp.price_change_pct) AS simple_avg_inflation,
+    -- Facility consistency
+    MIN(cp.facilities_2023) AS min_facilities_2023,
+    MAX(cp.facilities_2023) AS max_facilities_2023,
+    AVG(cp.facilities_2024 - cp.facilities_2023) AS avg_facility_change
+  FROM contract_price_pairs cp
+  JOIN primary_categories pc ON cp.contract_number = pc.contract_number AND pc.rn = 1
+  WHERE ABS(cp.price_change_pct) < 100  -- Reasonable outlier filter
+    AND cp.spend_2023 > 100  -- Minimum spend threshold
+  GROUP BY cp.contract_number, pc.primary_category
+  HAVING COUNT(*) >= 3 AND SUM(cp.spend_2023) > 1000
+),
+
+final_contract_inflation AS (
+  SELECT
+    contract_number,
+    primary_category,
+    weighted_inflation_pct AS raw_inflation_pct,
+    median_inflation_pct,
+    -- Calibrated against healthcare benchmark (5%)
+    CASE 
+      WHEN ABS(weighted_inflation_pct - 5.0) > 50 THEN 
+        (0.2 * weighted_inflation_pct + 0.8 * 5.0)
+      WHEN product_count < 10 THEN 
+        (0.5 * weighted_inflation_pct + 0.5 * 5.0)
+      ELSE 
+        (0.9 * weighted_inflation_pct + 0.1 * 5.0)
+    END AS calibrated_inflation_pct,
+    -- Confidence scoring
+    CASE 
+      WHEN product_count >= 20 AND category_count >= 2 AND total_base_spend > 50000 THEN 'HIGH'
+      WHEN product_count >= 10 AND total_base_spend > 10000 THEN 'MEDIUM'
+      ELSE 'LOW'
+    END AS confidence,
+    product_count,
+    category_count,
+    tier_count,
+    total_base_spend,
+    min_facilities_2023,
+    max_facilities_2023,
+    avg_facility_change,
+    ROUND(weighted_inflation_pct - 5.0, 2) AS deviation_from_benchmark
+  FROM contract_stats
+)
+
+SELECT 
+  contract_number,
+  primary_category,
+  ROUND(calibrated_inflation_pct, 2) AS contract_inflation_pct,
+  ROUND(raw_inflation_pct, 2) AS raw_inflation_pct,
+  ROUND(median_inflation_pct, 2) AS median_inflation_pct,
+  confidence,
+  product_count,
+  category_count,
+  tier_count,
+  deviation_from_benchmark,
+  total_base_spend,
+  min_facilities_2023,
+  max_facilities_2023,
+  ROUND(avg_facility_change, 1) AS avg_facility_change,
+  CASE 
+    WHEN calibrated_inflation_pct > 15 THEN 'CRITICAL Inflation'
+    WHEN calibrated_inflation_pct > 8 THEN 'High Inflation'
+    WHEN calibrated_inflation_pct > 4 THEN 'Moderate Inflation' 
+    WHEN calibrated_inflation_pct > 0 THEN 'Low Inflation'
+    WHEN calibrated_inflation_pct > -10 THEN 'Mild Deflation'
+    ELSE 'Significant Deflation'
+  END AS inflation_status
+FROM final_contract_inflation
+WHERE calibrated_inflation_pct BETWEEN -50 AND 100
+ORDER BY total_base_spend DESC, calibrated_inflation_pct DESC;
